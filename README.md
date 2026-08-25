@@ -37,7 +37,7 @@ Already compliant usage objects are not modified, so reasoning tokens cannot be 
 
 ## Installation
 
-The CLIProxyAPI plugin store listing is pending merge of [CLIProxyAPI-Plugins-Store PR #103](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store/pull/103). After it is merged, install **Gemini OpenAI Normalizer** from the store and restart CLIProxyAPI when prompted. No plugin configuration is required.
+The CLIProxyAPI plugin store listing is pending merge of [CLIProxyAPI-Plugins-Store PR #104](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store/pull/104). After it is merged, install **Gemini OpenAI Normalizer** from the store and restart CLIProxyAPI when prompted. No plugin configuration is required.
 
 Until then, install manually: download the archive for your platform from the latest GitHub Release, extract the single dynamic library into the configured CPA plugin directory, and restart CPA.
 
