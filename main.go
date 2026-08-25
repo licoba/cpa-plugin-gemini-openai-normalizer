@@ -244,25 +244,25 @@ func completeSSEPrefix(raw []byte) int {
 
 func completeSSEWithoutBlankLine(raw []byte) bool {
 	trimmed := bytes.TrimSpace(raw)
-	if bytes.Equal(trimmed, []byte("data: [DONE]")) {
-		return true
-	}
-	if len(raw) == 0 || raw[len(raw)-1] != '\n' {
+	if len(trimmed) == 0 {
 		return false
 	}
 	foundData := false
-	for _, line := range bytes.Split(raw, []byte("\n")) {
+	lastLineIsData := false
+	for _, line := range bytes.Split(trimmed, []byte("\n")) {
 		line = bytes.TrimSpace(bytes.TrimSuffix(line, []byte("\r")))
 		if !bytes.HasPrefix(line, []byte("data:")) {
+			lastLineIsData = false
 			continue
 		}
 		foundData = true
+		lastLineIsData = true
 		payload := bytes.TrimSpace(line[len("data:"):])
 		if !bytes.Equal(payload, []byte("[DONE]")) && !json.Valid(payload) {
 			return false
 		}
 	}
-	return foundData
+	return foundData && lastLineIsData
 }
 
 func takeStreamBuffer(requestID string) (bufferedStream, bool) {

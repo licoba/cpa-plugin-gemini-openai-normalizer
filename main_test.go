@@ -289,6 +289,43 @@ func TestStreamHandlerBuffersFragmentedSSE(t *testing.T) {
 	}
 }
 
+func TestStreamHandlerEmitsCompleteSSEDataLineWithoutNewline(t *testing.T) {
+	response := callStreamHandler(t, pluginapi.StreamChunkInterceptRequest{
+		RequestID:      "sse-without-newline",
+		Model:          "executed-model",
+		RequestedModel: "gemini-public-alias",
+		ChunkIndex:     0,
+		Body:           []byte(`data: {"type":"response.completed","response":{"object":"response","model":"executed-model"}}`),
+	})
+	if response.DropChunk || !strings.Contains(string(response.Body), `"model":"gemini-public-alias"`) {
+		t.Fatalf("complete SSE data line was not emitted: %#v", response)
+	}
+}
+
+func TestStreamHandlerEmitsFragmentedSSECompletedWithoutNewline(t *testing.T) {
+	first := callStreamHandler(t, pluginapi.StreamChunkInterceptRequest{
+		RequestID:      "fragmented-sse-without-newline",
+		Model:          "executed-model",
+		RequestedModel: "gemini-public-alias",
+		ChunkIndex:     0,
+		Body:           []byte(`data: {"type":"response.completed","response":{"object":"response","model":"executed`),
+	})
+	if !first.DropChunk {
+		t.Fatalf("incomplete SSE data line was not withheld: %#v", first)
+	}
+
+	second := callStreamHandler(t, pluginapi.StreamChunkInterceptRequest{
+		RequestID:      "fragmented-sse-without-newline",
+		Model:          "executed-model",
+		RequestedModel: "gemini-public-alias",
+		ChunkIndex:     1,
+		Body:           []byte(`-model"}}`),
+	})
+	if second.DropChunk || !strings.Contains(string(second.Body), `"model":"gemini-public-alias"`) {
+		t.Fatalf("completed SSE data line was not emitted: %#v", second)
+	}
+}
+
 func TestStreamBufferCapacityDoesNotDropNewChunks(t *testing.T) {
 	resetStreamBuffers()
 	defer resetStreamBuffers()
