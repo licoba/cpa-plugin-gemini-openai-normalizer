@@ -1,0 +1,9 @@
+dist/
+*.h
+*.so
+*.dylib
+*.dll
+*.zip
+*.sha256
+checksums.txt
+.DS_Store
