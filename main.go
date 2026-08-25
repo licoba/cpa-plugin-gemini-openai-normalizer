@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -28,6 +30,36 @@ func main() {}
 func isGeminiModel(model string) bool {
 	return strings.HasPrefix(model, "gemini-")
 }
+
+func clientModel(requestedModel, executedModel string) string {
+	if requestedModel != "" {
+		return requestedModel
+	}
+	return executedModel
+}
+
+type streamFormat uint8
+
+const (
+	streamFormatUnknown streamFormat = iota
+	streamFormatJSON
+	streamFormatSSE
+
+	maxBufferedStreamBytes = 1 << 20
+	maxBufferedStreams     = 1024
+	streamBufferTTL        = 5 * time.Minute
+)
+
+type bufferedStream struct {
+	format  streamFormat
+	body    []byte
+	updated time.Time
+}
+
+var streamBuffers = struct {
+	sync.Mutex
+	entries map[string]bufferedStream
+}{entries: make(map[string]bufferedStream)}
 
 func numeric(value any) (float64, bool) {
 	n, ok := value.(float64)
@@ -168,6 +200,212 @@ func normalizeStreamChunk(raw []byte, model string) ([]byte, bool, error) {
 	return bytes.Join(lines, []byte("\n")), true, nil
 }
 
+func detectStreamFormat(raw []byte) streamFormat {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return streamFormatUnknown
+	}
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		return streamFormatJSON
+	}
+	firstLine := trimmed
+	if index := bytes.IndexByte(firstLine, '\n'); index >= 0 {
+		firstLine = bytes.TrimSuffix(firstLine[:index], []byte("\r"))
+	}
+	for _, field := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:")} {
+		if bytes.HasPrefix(field, firstLine) || bytes.HasPrefix(firstLine, field) {
+			return streamFormatSSE
+		}
+	}
+	if bytes.HasPrefix(firstLine, []byte(":")) {
+		return streamFormatSSE
+	}
+	return streamFormatUnknown
+}
+
+func completeSSEPrefix(raw []byte) int {
+	lineStart := 0
+	lastBoundary := 0
+	for index, value := range raw {
+		if value != '\n' {
+			continue
+		}
+		contentEnd := index
+		if contentEnd > lineStart && raw[contentEnd-1] == '\r' {
+			contentEnd--
+		}
+		if contentEnd == lineStart {
+			lastBoundary = index + 1
+		}
+		lineStart = index + 1
+	}
+	return lastBoundary
+}
+
+func completeSSEWithoutBlankLine(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("data: [DONE]")) {
+		return true
+	}
+	if len(raw) == 0 || raw[len(raw)-1] != '\n' {
+		return false
+	}
+	foundData := false
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		line = bytes.TrimSpace(bytes.TrimSuffix(line, []byte("\r")))
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		foundData = true
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if !bytes.Equal(payload, []byte("[DONE]")) && !json.Valid(payload) {
+			return false
+		}
+	}
+	return foundData
+}
+
+func takeStreamBuffer(requestID string) (bufferedStream, bool) {
+	streamBuffers.Lock()
+	defer streamBuffers.Unlock()
+	buffer, ok := streamBuffers.entries[requestID]
+	if ok {
+		delete(streamBuffers.entries, requestID)
+	}
+	return buffer, ok
+}
+
+func storeStreamBuffer(requestID string, format streamFormat, body []byte) bool {
+	now := time.Now()
+	streamBuffers.Lock()
+	defer streamBuffers.Unlock()
+	for key, entry := range streamBuffers.entries {
+		if now.Sub(entry.updated) > streamBufferTTL {
+			delete(streamBuffers.entries, key)
+		}
+	}
+	if _, exists := streamBuffers.entries[requestID]; !exists && len(streamBuffers.entries) >= maxBufferedStreams {
+		return false
+	}
+	streamBuffers.entries[requestID] = bufferedStream{
+		format:  format,
+		body:    bytes.Clone(body),
+		updated: now,
+	}
+	return true
+}
+
+func discardStreamBuffer(requestID string) {
+	if requestID == "" {
+		return
+	}
+	streamBuffers.Lock()
+	delete(streamBuffers.entries, requestID)
+	streamBuffers.Unlock()
+}
+
+func resetStreamBuffers() {
+	streamBuffers.Lock()
+	streamBuffers.entries = make(map[string]bufferedStream)
+	streamBuffers.Unlock()
+}
+
+func normalizeStreamRequest(req pluginapi.StreamChunkInterceptRequest, model string) (pluginapi.StreamChunkInterceptResponse, error) {
+	response := pluginapi.StreamChunkInterceptResponse{}
+	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+		discardStreamBuffer(req.RequestID)
+		return response, nil
+	}
+	if !isGeminiModel(model) {
+		if req.ChunkIndex == 0 {
+			discardStreamBuffer(req.RequestID)
+		}
+		return response, nil
+	}
+	if req.RequestID == "" {
+		normalized, changed, err := normalizeStreamChunk(req.Body, model)
+		if changed {
+			response.Body = normalized
+		}
+		return response, err
+	}
+	if req.ChunkIndex == 0 {
+		discardStreamBuffer(req.RequestID)
+	}
+
+	buffer, hadBuffer := takeStreamBuffer(req.RequestID)
+	format := buffer.format
+	combined := append(bytes.Clone(buffer.body), req.Body...)
+	if !hadBuffer {
+		format = detectStreamFormat(combined)
+	}
+
+	switch format {
+	case streamFormatJSON:
+		if !json.Valid(bytes.TrimSpace(combined)) {
+			if len(combined) > maxBufferedStreamBytes {
+				response.Body = combined
+				return response, nil
+			}
+			if !storeStreamBuffer(req.RequestID, format, combined) {
+				if hadBuffer {
+					response.Body = combined
+				}
+				return response, nil
+			}
+			response.DropChunk = true
+			return response, nil
+		}
+		normalized, changed, err := normalizeStreamChunk(combined, model)
+		if changed || hadBuffer {
+			response.Body = normalized
+		}
+		return response, err
+
+	case streamFormatSSE:
+		completeLength := completeSSEPrefix(combined)
+		if completeLength == 0 && completeSSEWithoutBlankLine(combined) {
+			completeLength = len(combined)
+		}
+		if completeLength == 0 {
+			if len(combined) > maxBufferedStreamBytes {
+				response.Body = combined
+				return response, nil
+			}
+			if !storeStreamBuffer(req.RequestID, format, combined) {
+				if hadBuffer {
+					response.Body = combined
+				}
+				return response, nil
+			}
+			response.DropChunk = true
+			return response, nil
+		}
+		complete := combined[:completeLength]
+		remainder := combined[completeLength:]
+		if len(bytes.TrimSpace(remainder)) == 0 {
+			complete = combined
+			remainder = nil
+		}
+		normalized, changed, err := normalizeStreamChunk(complete, model)
+		if len(remainder) > 0 && !storeStreamBuffer(req.RequestID, format, remainder) {
+			response.Body = append(normalized, remainder...)
+			return response, err
+		}
+		if changed || hadBuffer || len(remainder) > 0 {
+			response.Body = normalized
+		}
+		return response, err
+
+	default:
+		normalized, changed, err := normalizeStreamChunk(req.Body, model)
+		if changed {
+			response.Body = normalized
+		}
+		return response, err
+	}
+}
+
 func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
@@ -208,7 +446,7 @@ func handleResponse(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, err
 	}
-	normalized, changed, err := normalizeJSONPayload(req.Body, req.Model)
+	normalized, changed, err := normalizeJSONPayload(req.Body, clientModel(req.RequestedModel, req.Model))
 	if err != nil {
 		return nil, err
 	}
@@ -224,13 +462,9 @@ func handleStreamChunk(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, err
 	}
-	normalized, changed, err := normalizeStreamChunk(req.Body, req.Model)
+	response, err := normalizeStreamRequest(req, clientModel(req.RequestedModel, req.Model))
 	if err != nil {
 		return nil, err
-	}
-	response := pluginapi.StreamChunkInterceptResponse{}
-	if changed {
-		response.Body = normalized
 	}
 	return okEnvelope(response)
 }

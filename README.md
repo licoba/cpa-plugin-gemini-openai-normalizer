@@ -10,7 +10,8 @@ For requested models whose names start with `gemini-`, the plugin:
 - reports the requested model alias in `response.model`;
 - includes reasoning tokens in `completion_tokens` when the upstream response proves it used the legacy accounting equation;
 - includes reasoning tokens in Responses `output_tokens` under the equivalent condition;
-- normalizes non-streaming JSON, raw JSON stream chunks, and SSE `data:` payloads.
+- normalizes non-streaming JSON, raw JSON stream chunks, and SSE `data:` payloads;
+- reassembles raw JSON and SSE events split across plugin ABI stream callbacks.
 
 Every non-Gemini response passes through unchanged.
 
@@ -32,12 +33,13 @@ Already compliant usage objects are not modified, so reasoning tokens cannot be 
 - OpenAI Chat Completions
 - OpenAI Responses
 - Non-streaming and streaming responses
+- Linux GLIBC 2.17 or newer
 
 ## Installation
 
-Install **Gemini OpenAI Normalizer** from the CLIProxyAPI plugin store and restart CLIProxyAPI when prompted. No plugin configuration is required.
+The CLIProxyAPI plugin store listing is pending merge of [CLIProxyAPI-Plugins-Store PR #103](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store/pull/103). After it is merged, install **Gemini OpenAI Normalizer** from the store and restart CLIProxyAPI when prompted. No plugin configuration is required.
 
-Manual installation is also supported: download the archive for your platform from the latest GitHub Release, extract the single dynamic library into the configured CPA plugin directory, and restart CPA.
+Until then, install manually: download the archive for your platform from the latest GitHub Release, extract the single dynamic library into the configured CPA plugin directory, and restart CPA.
 
 ## Verification
 
@@ -46,7 +48,7 @@ go test ./...
 go vet ./...
 ```
 
-The tests cover Chat ID/model/usage normalization, Responses usage normalization, raw JSON stream chunks, SSE events, and non-Gemini passthrough.
+The tests cover requested-model routing, Chat ID/model/usage normalization, Responses usage normalization, already-compliant token accounting, raw JSON and SSE stream fragmentation, CRLF/multi-event SSE framing, bounded stream state, ABI envelopes, and non-Gemini passthrough.
 
 ## Release assets
 
@@ -58,6 +60,7 @@ checksums.txt
 ```
 
 Each archive contains exactly one correctly named dynamic library at its root.
+Linux archives are built in manylinux2014 and rejected during CI if they require symbols newer than GLIBC 2.17.
 
 ## License
 
